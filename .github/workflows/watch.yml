@@ -1,0 +1,60 @@
+name: council-watch
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # every 5 minutes
+  workflow_dispatch:        # allow manual run for testing
+
+permissions:
+  contents: write           # for storing failure-counter state
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Ping council health endpoint
+        id: ping
+        run: |
+          set +e
+          STATUS=$(curl -s -o /tmp/body.json -w "%{http_code}" --max-time 10 "${{ secrets.COUNCIL_HEALTH_URL }}/healthz")
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "body=$(cat /tmp/body.json | base64 -w0)" >> $GITHUB_OUTPUT
+
+      - name: Update failure counter
+        id: counter
+        run: |
+          COUNT=$(cat .state/fail-count 2>/dev/null || echo 0)
+          if [ "${{ steps.ping.outputs.status }}" = "200" ]; then
+            echo "0" > .state/fail-count
+            echo "fails=0" >> $GITHUB_OUTPUT
+          else
+            COUNT=$((COUNT + 1))
+            mkdir -p .state
+            echo "$COUNT" > .state/fail-count
+            echo "fails=$COUNT" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit counter state
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "council-watch"
+          git add .state/fail-count
+          git diff --cached --quiet || git commit -m "fail-count=${{ steps.counter.outputs.fails }} status=${{ steps.ping.outputs.status }}"
+          git push
+
+      - name: Telegram alert if 3 strikes
+        if: ${{ steps.counter.outputs.fails == '3' }}
+        run: |
+          MSG=$(cat <<EOF
+          🚨 council-watch (cloud) — M3 health endpoint DOWN for 15+ minutes.
+          Status: ${{ steps.ping.outputs.status }}
+          Last response (base64): ${{ steps.ping.outputs.body }}
+          Both M3 sentinel and the M3 health endpoint may be offline. If you're traveling and M5 is asleep — phone home now.
+          EOF
+          )
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=1485229297 \
+            -d text="$MSG"
